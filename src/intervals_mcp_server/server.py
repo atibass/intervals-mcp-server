@@ -8,19 +8,15 @@ athlete data, including activities, events, workouts, and wellness metrics.
 
 import logging
 
-# Import API client and configuration
 from intervals_mcp_server.api.client import (
-    httpx_client,  # Re-export for backward compatibility with tests
+    httpx_client,
     make_intervals_request,
 )
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.mcp_instance import mcp
-
-# Import types and validation
 from intervals_mcp_server.server_setup import setup_transport, start_server
 from intervals_mcp_server.utils.validation import validate_athlete_id
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -28,10 +24,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("intervals_icu_mcp_server")
 
-# Get configuration instance
 config = get_config()
 
-# Import tool modules to register them (tools register themselves via @mcp.tool() decorators)
 from intervals_mcp_server.tools.activities import (  # pylint: disable=wrong-import-position  # noqa: E402
     add_activity_message,
     get_activities,
@@ -58,9 +52,6 @@ from intervals_mcp_server.tools.custom_items import (  # pylint: disable=wrong-i
     update_custom_item,
 )
 
-# Intervals.icu rejects unsupported stream names (for example `temperature`) with
-# HTTP 422. Replace the upstream registration with a read-only wrapper that only
-# forwards stream types known to be supported by this deployment.
 _ALLOWED_STREAM_TYPES = (
     "time",
     "watts",
@@ -86,12 +77,7 @@ async def get_activity_streams(
     api_key: str | None = None,
     stream_types: str | None = None,
 ) -> str:
-    """Get supported activity streams while silently dropping unsupported names.
-
-    Supported stream types are: time, watts, heartrate, cadence, altitude,
-    distance, core_temperature, skin_temperature, velocity_smooth.
-    Unsupported names such as `temperature` are removed before the API request.
-    """
+    """Get supported activity streams while silently dropping unsupported names."""
     sanitized_stream_types: str | None = None
 
     if stream_types:
@@ -113,9 +99,6 @@ async def get_activity_streams(
     )
 
 
-# This deployment is intentionally read-only. Some write tools are registered as
-# a side-effect of importing their modules, so remove them from FastMCP's public
-# registry after registration and before serving any client requests.
 _WRITE_TOOLS = (
     "add_activity_message",
     "add_or_update_event",
@@ -130,14 +113,13 @@ _WRITE_TOOLS = (
 for _tool_name in _WRITE_TOOLS:
     try:
         mcp.remove_tool(_tool_name)
-    except Exception:  # Tool may not exist in every upstream revision.
+    except Exception:
         logger.debug("Write tool not registered: %s", _tool_name)
 
+_exposed_tools = [tool.name for tool in mcp._tool_manager.list_tools()]  # pylint: disable=protected-access
 logger.info("Intervals.icu MCP started in read-only mode")
+logger.info("MCP exposed tools: %s", _exposed_tools)
 
-# Re-export make_intervals_request and httpx_client for backward compatibility.
-# Functions remain importable for upstream compatibility, but write functions are
-# not exposed as MCP tools.
 __all__ = [
     "make_intervals_request",
     "httpx_client",
