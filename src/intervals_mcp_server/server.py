@@ -38,7 +38,7 @@ from intervals_mcp_server.tools.activities import (  # pylint: disable=wrong-imp
     get_activity_details,
     get_activity_intervals,
     get_activity_messages,
-    get_activity_streams,
+    get_activity_streams as _get_activity_streams,
 )
 from intervals_mcp_server.tools.events import (  # pylint: disable=wrong-import-position  # noqa: E402
     add_or_update_event,
@@ -58,7 +58,62 @@ from intervals_mcp_server.tools.custom_items import (  # pylint: disable=wrong-i
     update_custom_item,
 )
 
-# This deployment is intentionally read-only.  Some write tools are registered as
+# Intervals.icu rejects unsupported stream names (for example `temperature`) with
+# HTTP 422. Replace the upstream registration with a read-only wrapper that only
+# forwards stream types known to be supported by this deployment.
+_ALLOWED_STREAM_TYPES = (
+    "time",
+    "watts",
+    "heartrate",
+    "cadence",
+    "altitude",
+    "distance",
+    "core_temperature",
+    "skin_temperature",
+    "velocity_smooth",
+)
+_ALLOWED_STREAM_TYPE_SET = set(_ALLOWED_STREAM_TYPES)
+
+try:
+    mcp.remove_tool("get_activity_streams")
+except Exception:
+    logger.debug("Upstream get_activity_streams tool was not registered")
+
+
+@mcp.tool()
+async def get_activity_streams(
+    activity_id: str,
+    api_key: str | None = None,
+    stream_types: str | None = None,
+) -> str:
+    """Get supported activity streams while silently dropping unsupported names.
+
+    Supported stream types are: time, watts, heartrate, cadence, altitude,
+    distance, core_temperature, skin_temperature, velocity_smooth.
+    Unsupported names such as `temperature` are removed before the API request.
+    """
+    sanitized_stream_types: str | None = None
+
+    if stream_types:
+        requested = [item.strip() for item in stream_types.split(",") if item.strip()]
+        sanitized = [item for item in requested if item in _ALLOWED_STREAM_TYPE_SET]
+
+        if not sanitized:
+            return (
+                "Error: no supported stream types requested. Supported types: "
+                + ",".join(_ALLOWED_STREAM_TYPES)
+            )
+
+        sanitized_stream_types = ",".join(sanitized)
+
+    return await _get_activity_streams(
+        activity_id=activity_id,
+        api_key=api_key,
+        stream_types=sanitized_stream_types,
+    )
+
+
+# This deployment is intentionally read-only. Some write tools are registered as
 # a side-effect of importing their modules, so remove them from FastMCP's public
 # registry after registration and before serving any client requests.
 _WRITE_TOOLS = (
