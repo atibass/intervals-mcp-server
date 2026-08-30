@@ -3,11 +3,18 @@
 This provider supports dynamic client registration, authorization-code + PKCE,
 refresh tokens, and bearer-token validation. Human approval is protected by a
 single deployment secret in MCP_OAUTH_PASSWORD.
+
+Access and refresh tokens are stateless HMAC-signed tokens so they remain valid
+across Railway deploys and process restarts. Short-lived authorization flow state
+remains in memory, which is sufficient for the interactive login exchange.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import hmac
+import json
 import os
 import secrets
 import time
@@ -32,10 +39,19 @@ class PendingAuthorization:
     expires_at: float
 
 
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding)
+
+
 class PrivateOAuthProvider(
     OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]
 ):
-    """In-memory OAuth provider intended for a single-replica private MCP service."""
+    """Private OAuth provider with stateless signed bearer/refresh tokens."""
 
     def __init__(self, issuer_url: str, resource_url: str) -> None:
         self.issuer_url = issuer_url.rstrip("/")
@@ -43,11 +59,67 @@ class PrivateOAuthProvider(
         self.clients: dict[str, OAuthClientInformationFull] = {}
         self.pending: dict[str, PendingAuthorization] = {}
         self.codes: dict[str, AuthorizationCode] = {}
-        self.access_tokens: dict[str, AccessToken] = {}
-        self.refresh_tokens: dict[str, RefreshToken] = {}
+
+        signing_secret = os.getenv("MCP_OAUTH_TOKEN_SECRET", "").strip()
+        if not signing_secret:
+            raise RuntimeError("MCP_OAUTH_TOKEN_SECRET must be configured when OAuth is enabled")
+        self._signing_secret = signing_secret.encode("utf-8")
+
+    def _encode_token(self, token_type: str, client_id: str, scopes: list[str], expires_at: int) -> str:
+        payload = {
+            "v": 1,
+            "typ": token_type,
+            "cid": client_id,
+            "scp": scopes,
+            "exp": expires_at,
+            "res": self.resource_url,
+            "sub": "private-user",
+            "jti": secrets.token_urlsafe(16),
+        }
+        body = _b64url_encode(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+        signature = hmac.new(self._signing_secret, body.encode("ascii"), hashlib.sha256).digest()
+        return f"{body}.{_b64url_encode(signature)}"
+
+    def _decode_token(self, token: str, expected_type: str) -> dict | None:
+        try:
+            body, supplied_signature = token.split(".", 1)
+            expected_signature = hmac.new(
+                self._signing_secret,
+                body.encode("ascii"),
+                hashlib.sha256,
+            ).digest()
+            if not hmac.compare_digest(_b64url_decode(supplied_signature), expected_signature):
+                return None
+            payload = json.loads(_b64url_decode(body).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+
+        if payload.get("v") != 1 or payload.get("typ") != expected_type:
+            return None
+        if int(payload.get("exp", 0)) < int(time.time()):
+            return None
+        if payload.get("res") != self.resource_url:
+            return None
+        if not isinstance(payload.get("cid"), str) or not isinstance(payload.get("scp"), list):
+            return None
+        return payload
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        return self.clients.get(client_id)
+        known = self.clients.get(client_id)
+        if known is not None:
+            return known
+
+        # After a process restart the dynamic-registration cache is empty. Token
+        # refresh still needs a client object. Treat previously registered clients
+        # as public clients; possession of the signed refresh token is the credential.
+        return OAuthClientInformationFull(
+            client_id=client_id,
+            redirect_uris=["https://chatgpt.com/connector_platform_oauth_redirect"],
+            token_endpoint_auth_method="none",
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            scope="mcp:read",
+        )
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         if not client_info.client_id:
@@ -108,25 +180,14 @@ class PrivateOAuthProvider(
     ) -> OAuthToken:
         self.codes.pop(authorization_code.code, None)
         now = int(time.time())
-        access_value = secrets.token_urlsafe(40)
-        refresh_value = secrets.token_urlsafe(40)
-        access = AccessToken(
-            token=access_value,
-            client_id=authorization_code.client_id,
-            scopes=authorization_code.scopes,
-            expires_at=now + 3600,
-            resource=authorization_code.resource or self.resource_url,
-            subject=authorization_code.subject,
+        access_exp = now + 3600
+        refresh_exp = now + 30 * 24 * 3600
+        access_value = self._encode_token(
+            "access", authorization_code.client_id, authorization_code.scopes, access_exp
         )
-        refresh = RefreshToken(
-            token=refresh_value,
-            client_id=authorization_code.client_id,
-            scopes=authorization_code.scopes,
-            expires_at=now + 30 * 24 * 3600,
-            subject=authorization_code.subject,
+        refresh_value = self._encode_token(
+            "refresh", authorization_code.client_id, authorization_code.scopes, refresh_exp
         )
-        self.access_tokens[access_value] = access
-        self.refresh_tokens[refresh_value] = refresh
         return OAuthToken(
             access_token=access_value,
             token_type="Bearer",
@@ -138,15 +199,16 @@ class PrivateOAuthProvider(
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> RefreshToken | None:
-        token = self.refresh_tokens.get(refresh_token)
-        if token is None:
+        payload = self._decode_token(refresh_token, "refresh")
+        if payload is None or client.client_id != payload["cid"]:
             return None
-        if token.expires_at is not None and token.expires_at < int(time.time()):
-            self.refresh_tokens.pop(refresh_token, None)
-            return None
-        if client.client_id != token.client_id:
-            return None
-        return token
+        return RefreshToken(
+            token=refresh_token,
+            client_id=payload["cid"],
+            scopes=list(payload["scp"]),
+            expires_at=int(payload["exp"]),
+            subject=payload.get("sub"),
+        )
 
     async def exchange_refresh_token(
         self,
@@ -154,28 +216,12 @@ class PrivateOAuthProvider(
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        self.refresh_tokens.pop(refresh_token.token, None)
         requested_scopes = scopes or refresh_token.scopes
         now = int(time.time())
-        access_value = secrets.token_urlsafe(40)
-        refresh_value = secrets.token_urlsafe(40)
-        access = AccessToken(
-            token=access_value,
-            client_id=refresh_token.client_id,
-            scopes=requested_scopes,
-            expires_at=now + 3600,
-            resource=self.resource_url,
-            subject=refresh_token.subject,
-        )
-        new_refresh = RefreshToken(
-            token=refresh_value,
-            client_id=refresh_token.client_id,
-            scopes=requested_scopes,
-            expires_at=now + 30 * 24 * 3600,
-            subject=refresh_token.subject,
-        )
-        self.access_tokens[access_value] = access
-        self.refresh_tokens[refresh_value] = new_refresh
+        access_exp = now + 3600
+        refresh_exp = now + 30 * 24 * 3600
+        access_value = self._encode_token("access", refresh_token.client_id, requested_scopes, access_exp)
+        refresh_value = self._encode_token("refresh", refresh_token.client_id, requested_scopes, refresh_exp)
         return OAuthToken(
             access_token=access_value,
             token_type="Bearer",
@@ -185,16 +231,19 @@ class PrivateOAuthProvider(
         )
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        access = self.access_tokens.get(token)
-        if access is None:
+        payload = self._decode_token(token, "access")
+        if payload is None:
             return None
-        if access.expires_at is not None and access.expires_at < int(time.time()):
-            self.access_tokens.pop(token, None)
-            return None
-        return access
+        return AccessToken(
+            token=token,
+            client_id=payload["cid"],
+            scopes=list(payload["scp"]),
+            expires_at=int(payload["exp"]),
+            resource=payload.get("res"),
+            subject=payload.get("sub"),
+        )
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
-        if isinstance(token, AccessToken):
-            self.access_tokens.pop(token.token, None)
-        else:
-            self.refresh_tokens.pop(token.token, None)
+        # Stateless tokens cannot be individually revoked without server-side state.
+        # Rotating MCP_OAUTH_TOKEN_SECRET revokes all currently issued tokens.
+        return None
