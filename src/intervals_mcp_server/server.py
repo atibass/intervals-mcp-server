@@ -2,11 +2,12 @@
 Intervals.icu MCP Server
 
 This module implements a Model Context Protocol (MCP) server for connecting
-Claude with the Intervals.icu API. It provides tools for retrieving and managing
-athlete data, including activities, events, workouts, and wellness metrics.
+clients with the Intervals.icu API. The deployed server is intentionally
+read-only.
 """
 
 import logging
+from typing import Any
 
 from intervals_mcp_server.api.client import (
     httpx_client,
@@ -32,7 +33,6 @@ from intervals_mcp_server.tools.activities import (  # pylint: disable=wrong-imp
     get_activity_details,
     get_activity_intervals,
     get_activity_messages,
-    get_activity_streams as _get_activity_streams,
 )
 from intervals_mcp_server.tools.events import (  # pylint: disable=wrong-import-position  # noqa: E402
     add_or_update_event,
@@ -64,7 +64,17 @@ _ALLOWED_STREAM_TYPES = (
     "velocity_smooth",
 )
 _ALLOWED_STREAM_TYPE_SET = set(_ALLOWED_STREAM_TYPES)
+_DEFAULT_STREAM_TYPES = (
+    "time",
+    "watts",
+    "heartrate",
+    "cadence",
+    "altitude",
+    "distance",
+    "velocity_smooth",
+)
 
+# Replace the upstream preview-oriented stream tool with a raw structured tool.
 try:
     mcp.remove_tool("get_activity_streams")
 except Exception:
@@ -76,10 +86,17 @@ async def get_activity_streams(
     activity_id: str,
     api_key: str | None = None,
     stream_types: str | None = None,
-) -> str:
-    """Get supported activity streams while silently dropping unsupported names."""
-    sanitized_stream_types: str | None = None
+) -> dict[str, Any] | str:
+    """Return full raw activity stream arrays from Intervals.icu.
 
+    Unsupported stream names are silently dropped before the upstream request.
+    Each returned stream preserves the Intervals.icu response, including its
+    complete ``data`` array; values are not sampled, summarized, or truncated by
+    this MCP server.
+
+    Supported stream types: time, watts, heartrate, cadence, altitude, distance,
+    core_temperature, skin_temperature, velocity_smooth.
+    """
     if stream_types:
         requested = [item.strip() for item in stream_types.split(",") if item.strip()]
         sanitized = [item for item in requested if item in _ALLOWED_STREAM_TYPE_SET]
@@ -89,14 +106,33 @@ async def get_activity_streams(
                 "Error: no supported stream types requested. Supported types: "
                 + ",".join(_ALLOWED_STREAM_TYPES)
             )
+        selected_types = sanitized
+    else:
+        selected_types = list(_DEFAULT_STREAM_TYPES)
 
-        sanitized_stream_types = ",".join(sanitized)
-
-    return await _get_activity_streams(
-        activity_id=activity_id,
+    result = await make_intervals_request(
+        url=f"/activity/{activity_id}/streams",
         api_key=api_key,
-        stream_types=sanitized_stream_types,
+        params={"types": ",".join(selected_types)},
     )
+
+    if isinstance(result, dict) and "error" in result:
+        error_message = result.get("message", "Unknown error")
+        return f"Error fetching activity streams: {error_message}"
+
+    if not result:
+        return f"No stream data found for activity {activity_id}."
+
+    if not isinstance(result, list):
+        return f"Unexpected stream response format for activity {activity_id}."
+
+    # Preserve every stream object exactly as returned by Intervals.icu so the
+    # caller receives the complete raw arrays rather than a 5+5 value preview.
+    return {
+        "activity_id": activity_id,
+        "requested_stream_types": selected_types,
+        "streams": result,
+    }
 
 
 _WRITE_TOOLS = (
