@@ -109,12 +109,16 @@ class PrivateOAuthProvider(
         if known is not None:
             return known
 
-        # After a process restart the dynamic-registration cache is empty. Token
-        # refresh still needs a client object. Treat previously registered clients
-        # as public clients; possession of the signed refresh token is the credential.
+        # Dynamic client registration is in-memory. After a Railway restart,
+        # reconstruct the private ChatGPT client sufficiently for authorization
+        # and token refresh. Restrict redirects to the known ChatGPT callback for
+        # this connector (plus the legacy platform callback for compatibility).
         return OAuthClientInformationFull(
             client_id=client_id,
-            redirect_uris=["https://chatgpt.com/connector_platform_oauth_redirect"],
+            redirect_uris=[
+                "https://chatgpt.com/connector/oauth/n7m3eu5ifdm6",
+                "https://chatgpt.com/connector_platform_oauth_redirect",
+            ],
             token_endpoint_auth_method="none",
             grant_types=["authorization_code", "refresh_token"],
             response_types=["code"],
